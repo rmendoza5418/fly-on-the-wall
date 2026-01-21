@@ -1,0 +1,7 @@
+/* CSS for the fake UI in portfolio if needed, purely decorative */
+.tray-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background-color: #ff4444; /* Recording red */
+}
