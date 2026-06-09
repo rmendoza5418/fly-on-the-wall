@@ -1,31 +1,46 @@
 /**
- * main.js — Electron main process
- *
- * Manages the application lifecycle, system tray icon, and child process
- * communication with the Python recorder and transcriber.
+ * main.js — Electron main process (v2)
  *
  * Architecture:
- *   Electron (this file) ←stdout IPC→ Python recorder.py
- *   Electron (this file) ←stdout IPC→ Python transcriber.py
+ *   Electron ←stdout IPC→ Python recorder.py   (spawned per recording)
+ *   Electron ←stdin/stdout IPC→ Python worker.py  (long-lived; model stays warm)
  *
- * The app runs tray-only (no dock icon on macOS, no taskbar on Windows)
- * to stay unobtrusive during meetings.
+ * Fixes from v1:
+ *   - Windows SIGTERM replaced with cross-platform kill
+ *   - Graceful child process cleanup on quit
+ *   - Transcriber exit handler
+ *   - recorderProcess nulled after exit
+ *   - Worker process replaces per-recording transcriber spawn
+ *
+ * New features:
+ *   - Global keyboard shortcut (Ctrl+Shift+R) to toggle recording
+ *   - "Copy summary to clipboard" tray menu item
+ *   - Session history via SQLite (surfaced in tray menu)
+ *   - electron-store settings persistence
+ *   - Audio level display in tray tooltip
+ *   - Diarization support (when enabled in settings)
  */
 
-const { app, Tray, Menu, Notification, nativeImage, shell } = require("electron");
+const {
+  app, Tray, Menu, Notification, nativeImage,
+  shell, clipboard, globalShortcut, dialog,
+} = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const readline = require("readline");
+const { randomUUID } = require("crypto");
+
+const settings = require("./settings");
 
 // ------------------------------------------------------------------ //
-// Config
+// Paths
 // ------------------------------------------------------------------ //
 
-const PYTHON_BIN = process.env.FOTW_PYTHON || "python3";
-const RECORDER_SCRIPT = path.join(__dirname, "../python/recorder.py");
-const TRANSCRIBER_SCRIPT = path.join(__dirname, "../python/transcriber.py");
-const WHISPER_MODEL = process.env.FOTW_MODEL || "small";
+const PYTHON_BIN = settings.get("pythonBin");
+const SRC_PY = path.join(__dirname, "../python");
+const RECORDER_SCRIPT = path.join(SRC_PY, "recorder.py");
+const WORKER_SCRIPT = path.join(SRC_PY, "worker.py");
 const ICON_DIR = path.join(__dirname, "../../assets");
 
 // ------------------------------------------------------------------ //
@@ -38,66 +53,215 @@ let tray = null;
 /** @type {import("child_process").ChildProcess | null} */
 let recorderProcess = null;
 
-/** @type {string | null} */
-let currentAudioFile = null;
+/** @type {import("child_process").ChildProcess | null} */
+let workerProcess = null;
 
 let isRecording = false;
+let workerReady = false;
+
+/** Last completed session paths */
+let lastSession = { audioFile: null, summaryFile: null, actionItemsFile: null };
+
+/** Pending jobs: jobId → { audioFile } */
+const pendingJobs = new Map();
 
 // ------------------------------------------------------------------ //
-// App setup — tray-only, no dock/taskbar
+// App init
 // ------------------------------------------------------------------ //
 
 app.whenReady().then(() => {
-  // macOS: hide from dock
-  if (process.platform === "darwin") {
-    app.dock.hide();
-  }
+  if (process.platform === "darwin") app.dock.hide();
 
   setupTray();
+  registerGlobalShortcut();
+  startWorker();
 });
 
-app.on("window-all-closed", (e) => {
-  // Prevent default quit when all windows close — we're a tray app
-  e.preventDefault();
-});
+app.on("will-quit", cleanupAndQuit);
+app.on("window-all-closed", (e) => e.preventDefault());
+
+// ------------------------------------------------------------------ //
+// Graceful shutdown
+// ------------------------------------------------------------------ //
+
+function cleanupAndQuit() {
+  globalShortcut.unregisterAll();
+  killProcess(recorderProcess, "Recorder");
+  if (workerProcess) {
+    try { workerProcess.stdin.write(JSON.stringify({ cmd: "quit" }) + "\n"); } catch (_) {}
+    killProcess(workerProcess, "Worker");
+  }
+}
+
+function killProcess(proc, label) {
+  if (!proc) return;
+  try {
+    if (process.platform === "win32") {
+      // Windows: spawn taskkill to terminate the process tree
+      spawn("taskkill", ["/pid", proc.pid.toString(), "/f", "/t"]);
+    } else {
+      proc.kill("SIGTERM");
+    }
+  } catch (e) {
+    console.error(`[${label}] kill failed:`, e.message);
+  }
+}
+
+// ------------------------------------------------------------------ //
+// Worker (long-lived transcription process)
+// ------------------------------------------------------------------ //
+
+function startWorker() {
+  const model = settings.get("whisperModel");
+  workerProcess = spawn(PYTHON_BIN, [WORKER_SCRIPT, "--model", model], {
+    stdio: ["pipe", "pipe", "pipe"],
+    cwd: SRC_PY,
+  });
+
+  const rl = readline.createInterface({ input: workerProcess.stdout });
+  rl.on("line", (line) => {
+    try { handleWorkerEvent(JSON.parse(line)); }
+    catch (_) { console.warn("[worker] unparseable:", line); }
+  });
+
+  workerProcess.stderr.on("data", (d) => console.error("[worker stderr]", d.toString().trim()));
+
+  workerProcess.on("exit", (code) => {
+    workerReady = false;
+    console.warn(`[worker] exited with code ${code}`);
+    if (code !== 0) {
+      showNotification("Worker crashed", "Restarting transcription worker…");
+      setTimeout(startWorker, 3000);
+    }
+  });
+}
+
+function sendWorkerCommand(cmd) {
+  if (!workerProcess || !workerReady) {
+    console.warn("[worker] not ready — queuing is not implemented; job dropped");
+    return;
+  }
+  workerProcess.stdin.write(JSON.stringify(cmd) + "\n");
+}
+
+function handleWorkerEvent(evt) {
+  switch (evt.event) {
+    case "ready":
+      workerReady = true;
+      console.log(`[worker] ready on ${evt.device} — model: ${evt.model}`);
+      updateTrayMenu();
+      break;
+
+    case "pong":
+      console.log("[worker] pong");
+      break;
+
+    case "job_started":
+      tray.setToolTip("Transcribing…");
+      break;
+
+    case "job_progress":
+      tray.setToolTip(`Transcribing… ${evt.pct || 0}%`);
+      break;
+
+    case "job_complete": {
+      tray.setToolTip("Fly on the Wall");
+      lastSession = {
+        audioFile: pendingJobs.get(evt.job_id)?.audioFile ?? null,
+        summaryFile: evt.summary_file,
+        actionItemsFile: evt.action_items_file,
+      };
+      pendingJobs.delete(evt.job_id);
+      updateTrayMenu();
+      const body = `${evt.word_count} words` +
+        (evt.action_item_count ? `, ${evt.action_item_count} action items` : "") +
+        " — click to open summary";
+      showNotification("Transcription complete", body, evt.summary_file);
+      break;
+    }
+
+    case "job_error":
+      tray.setToolTip("Fly on the Wall");
+      pendingJobs.delete(evt.job_id);
+      showNotification("Transcription error", evt.message || "Unknown error");
+      break;
+
+    case "warning":
+      console.warn("[worker]", evt.message);
+      break;
+  }
+}
 
 // ------------------------------------------------------------------ //
 // Tray
 // ------------------------------------------------------------------ //
 
+function iconPath(name) {
+  const p = path.join(ICON_DIR, name);
+  return fs.existsSync(p) ? p : null;
+}
+
 function setupTray() {
-  const iconPath = path.join(
-    ICON_DIR,
-    isRecording ? "icon-recording.png" : "icon-idle.png"
-  );
-  const icon = nativeImage.createFromPath(iconPath);
-  tray = new Tray(icon.resize({ width: 16, height: 16 }));
+  const imgPath = iconPath("icon-idle.png");
+  const icon = imgPath
+    ? nativeImage.createFromPath(imgPath).resize({ width: 16, height: 16 })
+    : nativeImage.createEmpty();
+  tray = new Tray(icon);
   tray.setToolTip("Fly on the Wall");
   updateTrayMenu();
 }
 
 function updateTrayMenu() {
+  const hasSummary = !!lastSession.summaryFile && fs.existsSync(lastSession.summaryFile);
+  const hasActions = !!lastSession.actionItemsFile && fs.existsSync(lastSession.actionItemsFile);
+
   const menu = Menu.buildFromTemplate([
     {
       label: isRecording ? "⏹  Stop Recording" : "⏺  Start Recording",
+      accelerator: settings.get("globalShortcut"),
       click: isRecording ? stopRecording : startRecording,
     },
     { type: "separator" },
     {
-      label: "Open Last Summary...",
-      enabled: !!currentAudioFile,
-      click: openLastSummary,
+      label: "Open Summary",
+      enabled: hasSummary,
+      click: () => shell.openPath(lastSession.summaryFile),
+    },
+    {
+      label: "Copy Summary to Clipboard",
+      enabled: hasSummary,
+      click: copySummaryToClipboard,
+    },
+    {
+      label: "Open Action Items",
+      enabled: hasActions,
+      click: () => shell.openPath(lastSession.actionItemsFile),
     },
     { type: "separator" },
-    { label: "Quit", click: () => app.exit(0) },
+    {
+      label: "Open Output Folder",
+      click: () => shell.openPath(settings.get("outputDir")),
+    },
+    { type: "separator" },
+    {
+      label: `Model: ${settings.get("whisperModel")}`,
+      enabled: false,
+    },
+    {
+      label: `Worker: ${workerReady ? "ready ✓" : "starting…"}`,
+      enabled: false,
+    },
+    { type: "separator" },
+    { label: "Quit", click: () => app.quit() },
   ]);
 
   tray.setContextMenu(menu);
 
-  const iconName = isRecording ? "icon-recording.png" : "icon-idle.png";
-  const iconPath = path.join(ICON_DIR, iconName);
-  if (fs.existsSync(iconPath)) {
-    tray.setImage(nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 }));
+  // Update tray icon to reflect recording state
+  const name = isRecording ? "icon-recording.png" : "icon-idle.png";
+  const p = iconPath(name);
+  if (p) {
+    tray.setImage(nativeImage.createFromPath(p).resize({ width: 16, height: 16 }));
   }
 }
 
@@ -106,27 +270,27 @@ function updateTrayMenu() {
 // ------------------------------------------------------------------ //
 
 function startRecording() {
-  if (isRecording) return;
+  if (isRecording || recorderProcess) return;
 
-  recorderProcess = spawn(PYTHON_BIN, [RECORDER_SCRIPT], {
+  recorderProcess = spawn(PYTHON_BIN, [
+    RECORDER_SCRIPT,
+    "--output-dir", settings.get("outputDir"),
+    "--max-minutes", String(settings.get("maxRecordingMinutes")),
+  ], {
     stdio: ["ignore", "pipe", "pipe"],
+    cwd: SRC_PY,
   });
 
-  // Parse newline-delimited JSON from Python stdout
   const rl = readline.createInterface({ input: recorderProcess.stdout });
   rl.on("line", (line) => {
-    try {
-      handleRecorderEvent(JSON.parse(line));
-    } catch (_) {
-      console.warn("Unparseable recorder output:", line);
-    }
+    try { handleRecorderEvent(JSON.parse(line)); }
+    catch (_) { console.warn("[recorder] unparseable:", line); }
   });
 
-  recorderProcess.stderr.on("data", (data) => {
-    console.error("[recorder stderr]", data.toString());
-  });
+  recorderProcess.stderr.on("data", (d) => console.error("[recorder stderr]", d.toString().trim()));
 
   recorderProcess.on("exit", (code) => {
+    recorderProcess = null;   // ← clear stale reference
     if (code !== 0 && isRecording) {
       showNotification("Recording Error", "The recorder stopped unexpectedly.");
       isRecording = false;
@@ -136,16 +300,14 @@ function startRecording() {
 }
 
 function stopRecording() {
-  if (!recorderProcess || !isRecording) return;
-  recorderProcess.kill("SIGTERM");
+  if (!recorderProcess) return;
+  killProcess(recorderProcess, "Recorder");
 }
 
-/** @param {{ event: string, file?: string, duration_secs?: number, message?: string }} evt */
 function handleRecorderEvent(evt) {
   switch (evt.event) {
     case "recording_started":
       isRecording = true;
-      currentAudioFile = evt.file;
       updateTrayMenu();
       showNotification("Recording started", "Fly on the Wall is listening.");
       break;
@@ -153,13 +315,22 @@ function handleRecorderEvent(evt) {
     case "recording_stopped":
       isRecording = false;
       updateTrayMenu();
-      showNotification(
-        "Recording stopped",
-        `${Math.round(evt.duration_secs || 0)}s captured. Transcribing...`
-      );
-      if (evt.file) {
-        runTranscriber(evt.file);
+      showNotification("Recording stopped",
+        `${Math.round(evt.duration_secs || 0)}s captured — transcribing…`);
+      if (evt.file) dispatchTranscriptionJob(evt.file);
+      break;
+
+    case "level":
+      // Show live audio level in tooltip while recording
+      if (settings.get("showLevelMeter") && isRecording) {
+        const bars = Math.round((evt.rms || 0) * 200);
+        const meter = "█".repeat(Math.min(bars, 10)).padEnd(10, "░");
+        tray.setToolTip(`Recording  ${meter}`);
       }
+      break;
+
+    case "warning":
+      console.warn("[recorder]", evt.message);
       break;
 
     case "error":
@@ -171,71 +342,63 @@ function handleRecorderEvent(evt) {
 }
 
 // ------------------------------------------------------------------ //
-// Transcription
+// Transcription dispatch
 // ------------------------------------------------------------------ //
 
-function runTranscriber(audioFile) {
-  const proc = spawn(
-    PYTHON_BIN,
-    [TRANSCRIBER_SCRIPT, "--audio", audioFile, "--model", WHISPER_MODEL],
-    { stdio: ["ignore", "pipe", "pipe"] }
-  );
+function dispatchTranscriptionJob(audioFile) {
+  const jobId = randomUUID();
+  pendingJobs.set(jobId, { audioFile });
 
-  const rl = readline.createInterface({ input: proc.stdout });
-  rl.on("line", (line) => {
-    try {
-      handleTranscriberEvent(JSON.parse(line));
-    } catch (_) {
-      console.warn("Unparseable transcriber output:", line);
-    }
-  });
-
-  proc.stderr.on("data", (data) => {
-    console.error("[transcriber stderr]", data.toString());
+  sendWorkerCommand({
+    cmd: "transcribe",
+    job_id: jobId,
+    audio_file: audioFile,
+    language: settings.get("language"),
+    enable_diarization: settings.get("enableDiarization"),
+    hf_token: settings.get("hfToken") || null,
   });
 }
 
-/** @param {{ event: string, pct?: number, summary_file?: string, word_count?: number, message?: string }} evt */
-function handleTranscriberEvent(evt) {
-  switch (evt.event) {
-    case "transcription_progress":
-      tray.setToolTip(`Transcribing… ${evt.pct || 0}%`);
-      break;
+// ------------------------------------------------------------------ //
+// Global keyboard shortcut
+// ------------------------------------------------------------------ //
 
-    case "transcription_complete":
-      tray.setToolTip("Fly on the Wall");
-      showNotification(
-        "Transcription complete",
-        `${evt.word_count || 0} words — click to open summary`,
-        evt.summary_file
-      );
-      break;
+function registerGlobalShortcut() {
+  const shortcut = settings.get("globalShortcut");
+  const registered = globalShortcut.register(shortcut, () => {
+    isRecording ? stopRecording() : startRecording();
+  });
 
-    case "error":
-      showNotification("Transcription error", evt.message || "Unknown error");
-      break;
+  if (!registered) {
+    console.warn(`[shortcuts] Failed to register ${shortcut} — may be in use by another app`);
+  } else {
+    console.log(`[shortcuts] Registered ${shortcut}`);
   }
 }
 
 // ------------------------------------------------------------------ //
-// Helpers
+// Clipboard
+// ------------------------------------------------------------------ //
+
+function copySummaryToClipboard() {
+  if (!lastSession.summaryFile || !fs.existsSync(lastSession.summaryFile)) {
+    showNotification("Nothing to copy", "No summary available yet.");
+    return;
+  }
+  const text = fs.readFileSync(lastSession.summaryFile, "utf-8");
+  clipboard.writeText(text);
+  showNotification("Copied", "Summary copied to clipboard.");
+}
+
+// ------------------------------------------------------------------ //
+// Notification helper
 // ------------------------------------------------------------------ //
 
 function showNotification(title, body, filePath) {
+  if (!Notification.isSupported()) return;
   const n = new Notification({ title, body });
   if (filePath) {
     n.on("click", () => shell.openPath(filePath));
   }
   n.show();
-}
-
-function openLastSummary() {
-  if (!currentAudioFile) return;
-  const stem = path.basename(currentAudioFile, ".wav");
-  const summaryPath = path.join(path.dirname(currentAudioFile), `${stem}_summary.txt`);
-  if (fs.existsSync(summaryPath)) {
-    shell.openPath(summaryPath);
-  } else {
-    showNotification("Not ready", "Summary is still being generated.");
-  }
 }

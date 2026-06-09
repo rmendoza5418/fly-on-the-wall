@@ -1,11 +1,12 @@
 {
   "name": "fly-on-the-wall",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Local-first, privacy-focused meeting recorder and transcriber",
   "main": "src/electron/main.js",
   "scripts": {
     "start": "electron .",
     "dev": "FOTW_MODEL=tiny electron .",
+    "setup": "pip install -r requirements.txt && python scripts/generate_icons.py",
     "build:mac": "electron-builder --mac",
     "build:win": "electron-builder --win",
     "build:linux": "electron-builder --linux"
@@ -13,6 +14,11 @@
   "build": {
     "appId": "com.rmendoza.fly-on-the-wall",
     "productName": "Fly on the Wall",
+    "files": [
+      "src/electron/**/*",
+      "src/python/**/*",
+      "assets/**/*"
+    ],
     "mac": {
       "category": "public.app-category.productivity",
       "extendInfo": {
@@ -26,11 +32,13 @@
       "target": "AppImage"
     }
   },
-  "dependencies": {},
-  "devDependencies": {
-    "electron": "^29.0.0",
-    "electron-builder": "^24.0.0"
+  "dependencies": {
+    "electron-store": "^10.0.0"
   },
-  "keywords": ["transcription", "whisper", "privacy", "meeting"],
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "keywords": ["transcription", "whisper", "privacy", "meeting", "local-ai"],
   "license": "MIT"
 }

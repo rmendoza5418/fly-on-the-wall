@@ -2,7 +2,11 @@ node_modules/
 dist/
 *.wav
 *.txt
+*.json
+!package.json
+!src/**/*.json
 models/
 __pycache__/
 *.pyc
 .DS_Store
+~/.fotw/
