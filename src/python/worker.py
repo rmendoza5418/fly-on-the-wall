@@ -12,7 +12,10 @@ Emits events via stdout (newline-delimited JSON events).
 
 Start a transcription job:
     {"cmd": "transcribe", "job_id": "abc", "audio_file": "/path/to.wav",
-     "language": "en", "enable_diarization": false, "hf_token": null}
+     "language": "en", "enable_diarization": false, "hf_token": null,
+     "ollama_model": "llama3.2", "ollama_url": "http://localhost:11434"}
+
+    Set ollama_model to null to disable Ollama and use extractive (sumy) summarization.
 
 Ping / health check:
     {"cmd": "ping"}
@@ -29,7 +32,8 @@ Graceful shutdown:
     {"event": "job_complete",  "job_id": "abc", "transcript_file": "...",
                                 "summary_file": "...", "action_items_file": "...",
                                 "word_count": 312, "action_item_count": 4,
-                                "duration_secs": 3.2, "segments_file": "..."}
+                                "duration_secs": 3.2, "segments_file": "...",
+                                "summarizer": "ollama/llama3.2|sumy"}
     {"event": "job_error",     "job_id": "abc", "message": "..."}
     {"event": "warning",       "message": "..."}
 """
@@ -37,6 +41,7 @@ Graceful shutdown:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import sys
 import time
@@ -56,6 +61,9 @@ from history import log_session
 SUMMARY_SENTENCES = 8
 DEFAULT_MODEL = "small"
 MODELS_DIR = Path.home() / ".fotw" / "models"
+OLLAMA_DEFAULT_URL = "http://localhost:11434"
+OLLAMA_TIMEOUT_SECS = 90
+OLLAMA_MAX_WORDS = 6000  # truncate long transcripts to stay within model context
 
 
 # ------------------------------------------------------------------ #
@@ -147,9 +155,8 @@ def build_timestamped_transcript(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def summarize(text: str) -> str:
-    if not text.strip():
-        return "No speech detected."
+def _sumy_summarize(text: str) -> str:
+    """Extractive summarization via sumy LSA (fast, no model required)."""
     parser = PlaintextParser.from_string(text, Tokenizer("english"))
     stemmer = Stemmer("english")
     summarizer = LsaSummarizer(stemmer)
@@ -158,6 +165,82 @@ def summarize(text: str) -> str:
     if not sentences:
         return text[:500]
     return "\n• " + "\n• ".join(str(s) for s in sentences)
+
+
+def _ollama_summarize(text: str, model: str, base_url: str) -> str:
+    """
+    Abstractive summarization via Ollama local LLM.
+
+    Runs in a thread so we can enforce a hard timeout. The `ollama` package
+    must be installed (`pip install ollama`). Raises on any failure so the
+    caller can fall back to sumy.
+    """
+    # Truncate very long transcripts to avoid context overflow on smaller models
+    words = text.split()
+    if len(words) > OLLAMA_MAX_WORDS:
+        text = " ".join(words[:OLLAMA_MAX_WORDS]) + "\n[transcript truncated]"
+
+    prompt = (
+        "You are a meeting notes assistant. Read the transcript below and write a "
+        "concise summary of what was discussed.\n\n"
+        f"Transcript:\n{text}\n\n"
+        "Instructions:\n"
+        "- Respond with bullet points only (one per line, starting with •)\n"
+        "- Cover the main topics, key decisions, and notable outcomes\n"
+        "- 6–10 bullets maximum\n"
+        "- No preamble, no headings, no explanation — just the bullets"
+    )
+
+    def _call() -> str:
+        import ollama  # optional dep — ImportError propagates to caller
+        resp = ollama.generate(
+            model=model,
+            prompt=prompt,
+            options={"temperature": 0.3},
+        )
+        return resp["response"].strip()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(_call)
+        raw = future.result(timeout=OLLAMA_TIMEOUT_SECS)
+
+    # Normalize to consistent bullet format regardless of what the model returned
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    cleaned = [ln.lstrip("•·–—-* \t") for ln in lines if ln.lstrip("•·–—-* \t")]
+    if not cleaned:
+        raise ValueError("Ollama returned empty response")
+    return "• " + "\n• ".join(cleaned)
+
+
+def summarize(
+    text: str,
+    ollama_model: str | None = None,
+    ollama_url: str = OLLAMA_DEFAULT_URL,
+) -> tuple[str, str]:
+    """
+    Summarize transcript text.
+
+    Tries Ollama first when ollama_model is set; falls back to sumy LSA on any
+    failure (Ollama not running, timeout, empty response, ImportError, etc.).
+
+    Returns (summary_text, summarizer_label) where label is e.g.
+    "ollama/llama3.2" or "sumy".
+    """
+    if not text.strip():
+        return "No speech detected.", "none"
+
+    if ollama_model:
+        try:
+            summary = _ollama_summarize(text, ollama_model, ollama_url)
+            return summary, f"ollama/{ollama_model}"
+        except concurrent.futures.TimeoutError:
+            emit({"event": "warning",
+                  "message": f"Ollama timed out after {OLLAMA_TIMEOUT_SECS}s — falling back to extractive summary"})
+        except Exception as exc:
+            emit({"event": "warning",
+                  "message": f"Ollama unavailable ({exc}) — falling back to extractive summary"})
+
+    return _sumy_summarize(text), "sumy"
 
 
 # ------------------------------------------------------------------ #
@@ -215,6 +298,8 @@ def handle_transcribe(model: WhisperModel, cmd: dict) -> None:
     language = cmd.get("language", "en")
     enable_diarization = cmd.get("enable_diarization", False)
     hf_token = cmd.get("hf_token")
+    ollama_model = cmd.get("ollama_model") or None   # None → use sumy
+    ollama_url = cmd.get("ollama_url") or OLLAMA_DEFAULT_URL
 
     if not audio_file:
         emit({"event": "job_error", "job_id": job_id, "message": "No audio_file provided"})
@@ -246,7 +331,7 @@ def handle_transcribe(model: WhisperModel, cmd: dict) -> None:
                 emit({"event": "warning", "message": f"Diarization failed: {e} — continuing without"})
 
         action_items = extract_action_items(full_text)
-        summary = summarize(full_text)
+        summary, summarizer_label = summarize(full_text, ollama_model=ollama_model, ollama_url=ollama_url)
         paths = write_outputs(audio_path, full_text, segments, summary, action_items)
 
         elapsed = time.monotonic() - t0
@@ -276,6 +361,7 @@ def handle_transcribe(model: WhisperModel, cmd: dict) -> None:
             "word_count": word_count,
             "action_item_count": len(action_items),
             "processing_secs": round(elapsed, 2),
+            "summarizer": summarizer_label,
         })
 
     except Exception as exc:

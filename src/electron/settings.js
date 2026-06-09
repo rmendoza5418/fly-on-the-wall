@@ -51,6 +51,18 @@ const schema = {
     type: "boolean",
     default: true,
   },
+  ollamaEnabled: {
+    type: "boolean",
+    default: false,
+  },
+  ollamaModel: {
+    type: "string",
+    default: "llama3.2",
+  },
+  ollamaUrl: {
+    type: "string",
+    default: "http://localhost:11434",
+  },
 };
 
 const store = new Store({ schema, name: "fotw-settings" });

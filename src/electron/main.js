@@ -244,7 +244,11 @@ function updateTrayMenu() {
     },
     { type: "separator" },
     {
-      label: `Model: ${settings.get("whisperModel")}`,
+      label: `Whisper: ${settings.get("whisperModel")}`,
+      enabled: false,
+    },
+    {
+      label: `Summarizer: ${settings.get("ollamaEnabled") ? settings.get("ollamaModel") : "extractive"}`,
       enabled: false,
     },
     {
@@ -349,6 +353,7 @@ function dispatchTranscriptionJob(audioFile) {
   const jobId = randomUUID();
   pendingJobs.set(jobId, { audioFile });
 
+  const ollamaEnabled = settings.get("ollamaEnabled");
   sendWorkerCommand({
     cmd: "transcribe",
     job_id: jobId,
@@ -356,6 +361,8 @@ function dispatchTranscriptionJob(audioFile) {
     language: settings.get("language"),
     enable_diarization: settings.get("enableDiarization"),
     hf_token: settings.get("hfToken") || null,
+    ollama_model: ollamaEnabled ? settings.get("ollamaModel") : null,
+    ollama_url: settings.get("ollamaUrl"),
   });
 }
 
